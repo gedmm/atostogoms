@@ -29,12 +29,29 @@ pip install -r requirements.txt
 Open `config.yaml`:
 - Add/remove RSS feeds under `feeds:`. Most travel blogs run WordPress, so
   `https://sitename.com/feed/` usually works even for sites not listed.
-- Adjust `error_fare_keywords` — this is what decides whether a post is
-  "hot" enough to alert you. Add your own terms (airline names, "glitch
-  fare", etc).
-- Optionally narrow to specific origins/destinations with
-  `origin_keywords` / `destination_keywords`.
+- Filtering uses a **two-tier rule** — a post is flagged if either is true:
+  - **Priority routes**: departs one of your `origin_priority_keywords`
+    airports/cities AND price ≤ `price_max_normal_eur` (default €550).
+  - **Hot deals**: departs *anywhere* in `origin_europe_keywords` AND
+    it's an error/mistake fare (`error_fare_keywords`) OR price ≤
+    `price_max_hot_eur` (default €350) — error fares bypass the price
+    check entirely, since they're worth knowing about even if expensive.
+  - Price is parsed straight out of the post's title/summary text
+    (handles €, £, $, PLN, and Nordic "kr", converted to EUR using the
+    approximate rates in `currency_to_eur_rates` — update these
+    periodically since they'll drift). If no price can be found in the
+    text, a post can still match Tier 2 via error-fare language alone,
+    but never matches Tier 1 (price is required there).
+  - Edit `origin_priority_keywords` to your actual home airports —
+    ships with Vilnius, Riga, Warsaw, Copenhagen, Stockholm, and Milan
+    by default.
+  - Optionally narrow by destination with `destination_keywords`
+    (empty = any destination).
 - Pick a notification channel below and enable it.
+
+Each alert is tagged so you can tell at a glance why it matched:
+`🔥 HOT DEAL (error fare)`, `🔥 HOT DEAL (under hot-deal threshold, ~€180)`,
+or `⭐ PRIORITY ROUTE (~€480)`.
 
 ## 3. Set up notifications (pick at least one)
 
