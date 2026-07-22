@@ -184,3 +184,10 @@ notifications:
 # via Docker, docker-compose.yml mounts ./data as /app/data so this
 # persists across container restarts/rebuilds.
 seen_items_file: "data/seen_items.json"
+
+# Tracks consecutive fetch failures per feed, so you get alerted if one
+# goes down (site redesign, feed URL changed, etc.) instead of silently
+# missing deals from it forever.
+feed_health_file: "data/feed_health.json"
+feed_failure_alert_threshold: 3   # consecutive failed checks before the first alert
+feed_failure_realert_every: 6     # re-alert every N additional failures after that (0 = alert once only)
