@@ -77,6 +77,23 @@ def save_seen(path: Path, seen: set) -> None:
     path.write_text(json.dumps(trimmed), encoding="utf-8")
 
 
+def load_feed_health(path: Path) -> dict:
+    """Per-feed consecutive-failure tracking, keyed by feed name.
+    Shape: {feed_name: {"consecutive_failures": int, "alerted_at": int|None}}
+    """
+    if path.exists():
+        try:
+            return json.loads(path.read_text(encoding="utf-8"))
+        except (json.JSONDecodeError, OSError):
+            log.warning("Could not read %s, starting fresh.", path)
+    return {}
+
+
+def save_feed_health(path: Path, health: dict) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(health), encoding="utf-8")
+
+
 def item_id(entry) -> str:
     """Stable unique id for a feed entry (guid if present, else hash of link+title)."""
     raw = entry.get("id") or entry.get("link", "") + entry.get("title", "")
@@ -88,14 +105,19 @@ def item_id(entry) -> str:
 # ---------------------------------------------------------------------
 
 def fetch_feed(name: str, url: str):
+    """Returns (entries, ok). ok=False means the fetch/parse genuinely failed
+    (network error, unparseable response) — NOT the same as "feed had 0 posts
+    today," which is a normal, healthy outcome and still returns ok=True.
+    """
     try:
         parsed = feedparser.parse(url, request_headers={"User-Agent": "Mozilla/5.0 (deal-monitor/1.0)"})
         if parsed.bozo and not parsed.entries:
             log.warning("Feed '%s' failed to parse cleanly (%s)", name, parsed.get("bozo_exception"))
-        return parsed.entries
+            return [], False
+        return parsed.entries, True
     except Exception as e:  # noqa: BLE001
         log.error("Error fetching feed '%s' (%s): %s", name, url, e)
-        return []
+        return [], False
 
 
 def matches_keywords(text: str, keywords: list) -> bool:
@@ -316,36 +338,161 @@ def dispatch_notifications(cfg: dict, source: str, entry, match: dict) -> bool:
     return all_ok
 
 
+# --- Feed-down alerts (separate from deal alerts: plain-text message, no entry/match) ---
+
+def notify_feed_alert_telegram(cfg: dict, message: str) -> bool:
+    token = os.environ.get(cfg["bot_token_env"], "")
+    chat_id = os.environ.get(cfg["chat_id_env"], "")
+    if not token or not chat_id:
+        return False
+    try:
+        resp = requests.post(
+            f"https://api.telegram.org/bot{token}/sendMessage",
+            data={"chat_id": chat_id, "text": f"⚠️ *Feed Alert*\n{message}", "parse_mode": "Markdown"},
+            timeout=15,
+        )
+        return resp.ok
+    except requests.RequestException as e:
+        log.error("Telegram feed-alert send error: %s", e)
+        return False
+
+
+def notify_feed_alert_discord(cfg: dict, message: str) -> bool:
+    webhook = os.environ.get(cfg["webhook_url_env"], "")
+    if not webhook:
+        return False
+    try:
+        resp = requests.post(webhook, json={"content": f"⚠️ **Feed Alert**\n{message}"}, timeout=15)
+        return resp.status_code < 300
+    except requests.RequestException as e:
+        log.error("Discord feed-alert send error: %s", e)
+        return False
+
+
+def notify_feed_alert_email(cfg: dict, message: str) -> bool:
+    from_addr = os.environ.get(cfg["from_addr_env"], "")
+    password = os.environ.get(cfg["password_env"], "")
+    to_addr = os.environ.get(cfg["to_addr_env"], "")
+    if not (from_addr and password and to_addr):
+        return False
+    msg = MIMEText(message)
+    msg["Subject"] = "[Deal Monitor] Feed alert"
+    msg["From"] = from_addr
+    msg["To"] = to_addr
+    try:
+        with smtplib.SMTP(cfg["smtp_host"], cfg["smtp_port"]) as server:
+            server.starttls()
+            server.login(from_addr, password)
+            server.sendmail(from_addr, [to_addr], msg.as_string())
+        return True
+    except Exception as e:  # noqa: BLE001
+        log.error("Email feed-alert send error: %s", e)
+        return False
+
+
+def dispatch_feed_alert(cfg: dict, message: str) -> bool:
+    notif_cfg = cfg.get("notifications", {})
+    all_ok = True
+    if notif_cfg.get("console", True):
+        print("\n" + "!" * 60)
+        print("⚠️  FEED ALERT")
+        print(message)
+        print("!" * 60)
+    if notif_cfg.get("telegram", {}).get("enabled"):
+        all_ok = notify_feed_alert_telegram(notif_cfg["telegram"], message) and all_ok
+    if notif_cfg.get("discord", {}).get("enabled"):
+        all_ok = notify_feed_alert_discord(notif_cfg["discord"], message) and all_ok
+    if notif_cfg.get("email", {}).get("enabled"):
+        all_ok = notify_feed_alert_email(notif_cfg["email"], message) and all_ok
+    return all_ok
+
+
+def update_feed_health(health: dict, name: str, ok: bool, cfg: dict):
+    """Track consecutive fetch failures per feed. Returns an alert message
+    string if an alert should fire this run, else None.
+    """
+    state = health.setdefault(name, {"consecutive_failures": 0})
+    if ok:
+        if state["consecutive_failures"] > 0:
+            log.info("Feed '%s' recovered after %d consecutive failure(s).", name, state["consecutive_failures"])
+        state["consecutive_failures"] = 0
+        return None
+
+    state["consecutive_failures"] += 1
+    count = state["consecutive_failures"]
+    threshold = cfg.get("feed_failure_alert_threshold", 3)
+    realert_every = cfg.get("feed_failure_realert_every", 6)
+
+    should_alert = count == threshold
+    if not should_alert and realert_every and count > threshold:
+        should_alert = (count - threshold) % realert_every == 0
+
+    if should_alert:
+        return (
+            f"Feed '{name}' has failed to fetch {count} time(s) in a row. "
+            f"It may be down, or its RSS URL may have changed — check config.yaml."
+        )
+    return None
+
+
 # ---------------------------------------------------------------------
 # Core run loop
 # ---------------------------------------------------------------------
 
-def run_once(cfg: dict, seen_path: Path, ignore_keywords: bool = False) -> tuple[int, int]:
+def run_once(cfg: dict, seen_path: Path, health_path: Path, ignore_keywords: bool = False) -> tuple[int, int]:
     """Returns (new_matching_deals, notification_failures)."""
     seen = load_seen(seen_path)
-    new_count = 0
+    health = load_feed_health(health_path)
+
+    stats = {
+        "entries_checked": 0,   # every entry fetched this run, seen-before or not
+        "new_entries": 0,       # entries not previously seen
+        "matched_hot": 0,
+        "matched_priority": 0,
+        "matched_test": 0,
+        "dismissed": 0,         # new entries that did NOT match any tier
+    }
     failure_count = 0
 
     for feed in cfg.get("feeds", []):
         name, url = feed["name"], feed["url"]
-        entries = fetch_feed(name, url)
-        log.info("Checked '%s' — %d entries", name, len(entries))
+        entries, ok = fetch_feed(name, url)
+        stats["entries_checked"] += len(entries)
+        log.info("Checked '%s' — %s, %d entries", name, "OK" if ok else "FAILED", len(entries))
+
+        alert_message = update_feed_health(health, name, ok, cfg)
+        if alert_message:
+            log.error("FEED ALERT: %s", alert_message)
+            if not dispatch_feed_alert(cfg, alert_message):
+                failure_count += 1
+                log.error("Feed-alert delivery FAILED for feed: %s", name)
 
         for entry in entries:
             eid = item_id(entry)
             if eid in seen:
                 continue
             seen.add(eid)  # mark as seen regardless of match, so we don't re-check it forever
+            stats["new_entries"] += 1
 
             match = evaluate_deal(entry, cfg, ignore_keywords)
             if match["matched"]:
-                new_count += 1
+                stats[f"matched_{match['tier']}"] = stats.get(f"matched_{match['tier']}", 0) + 1
                 if not dispatch_notifications(cfg, name, entry, match):
                     failure_count += 1
                     log.error("Notification delivery FAILED for: %s", entry.get("title", ""))
+            else:
+                stats["dismissed"] += 1
 
     save_seen(seen_path, seen)
-    return new_count, failure_count
+    save_feed_health(health_path, health)
+
+    matched_total = stats["matched_hot"] + stats["matched_priority"] + stats["matched_test"]
+    log.info(
+        "Run summary: %d entries checked (%d new) — %d matched [%d hot, %d priority] — %d dismissed",
+        stats["entries_checked"], stats["new_entries"], matched_total,
+        stats["matched_hot"], stats["matched_priority"], stats["dismissed"],
+    )
+    return matched_total, failure_count
 
 
 def main():
@@ -357,23 +504,24 @@ def main():
 
     cfg = load_config(Path(args.config))
     seen_path = BASE_DIR / cfg.get("seen_items_file", "seen_items.json")
+    health_path = BASE_DIR / cfg.get("feed_health_file", "data/feed_health.json")
 
     if args.loop:
         interval = cfg.get("poll_interval_minutes", 15) * 60
         log.info("Starting monitor loop — polling every %d minutes. Ctrl+C to stop.", interval // 60)
         while True:
             try:
-                found, failures = run_once(cfg, seen_path, ignore_keywords=args.all)
+                found, failures = run_once(cfg, seen_path, health_path, ignore_keywords=args.all)
                 log.info("Cycle complete — %d new matching deal(s), %d notification failure(s).", found, failures)
             except Exception as e:  # noqa: BLE001 — keep the loop alive on transient errors
                 log.error("Unexpected error in cycle: %s", e)
             time.sleep(interval)
     else:
-        found, failures = run_once(cfg, seen_path, ignore_keywords=args.all)
+        found, failures = run_once(cfg, seen_path, health_path, ignore_keywords=args.all)
         log.info("Done — %d new matching deal(s), %d notification failure(s).", found, failures)
         if failures:
             log.error(
-                "%d deal(s) were found but NOT successfully delivered to a notification channel. "
+                "%d alert(s) were found but NOT successfully delivered to a notification channel. "
                 "Exiting with an error so this run is visible as a failure.", failures
             )
             sys.exit(1)
