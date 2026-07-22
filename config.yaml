@@ -53,8 +53,8 @@ error_fare_keywords:
 # be found, Tier 1 never matches (price is required); Tier 2 can still
 # match on error-fare language alone even with no price found.
 
-price_max_normal_eur: 550
-price_max_hot_eur: 350
+price_max_normal_eur: 450
+price_max_hot_eur: 300
 
 # Priority departure airports/cities — edit freely to match your
 # actual home airports. Matching is case-insensitive substring
