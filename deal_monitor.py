@@ -130,12 +130,12 @@ def notify_console(source: str, entry) -> None:
     print("=" * 60)
 
 
-def notify_telegram(cfg: dict, source: str, entry) -> None:
+def notify_telegram(cfg: dict, source: str, entry) -> bool:
     token = os.environ.get(cfg["bot_token_env"], "")
     chat_id = os.environ.get(cfg["chat_id_env"], "")
     if not token or not chat_id:
         log.warning("Telegram enabled but %s/%s env vars not set.", cfg["bot_token_env"], cfg["chat_id_env"])
-        return
+        return False
     text = f"✈️ *{source}*\n{entry.get('title', '')}\n{entry.get('link', '')}"
     try:
         resp = requests.post(
@@ -145,31 +145,37 @@ def notify_telegram(cfg: dict, source: str, entry) -> None:
         )
         if not resp.ok:
             log.error("Telegram send failed: %s %s", resp.status_code, resp.text)
+            return False
+        return True
     except requests.RequestException as e:
         log.error("Telegram send error: %s", e)
+        return False
 
 
-def notify_discord(cfg: dict, source: str, entry) -> None:
+def notify_discord(cfg: dict, source: str, entry) -> bool:
     webhook = os.environ.get(cfg["webhook_url_env"], "")
     if not webhook:
         log.warning("Discord enabled but %s env var not set.", cfg["webhook_url_env"])
-        return
+        return False
     content = f"✈️ **{source}**\n{entry.get('title', '')}\n{entry.get('link', '')}"
     try:
         resp = requests.post(webhook, json={"content": content}, timeout=15)
         if resp.status_code >= 300:
             log.error("Discord send failed: %s %s", resp.status_code, resp.text)
+            return False
+        return True
     except requests.RequestException as e:
         log.error("Discord send error: %s", e)
+        return False
 
 
-def notify_email(cfg: dict, source: str, entry) -> None:
+def notify_email(cfg: dict, source: str, entry) -> bool:
     from_addr = os.environ.get(cfg["from_addr_env"], "")
     password = os.environ.get(cfg["password_env"], "")
     to_addr = os.environ.get(cfg["to_addr_env"], "")
     if not (from_addr and password and to_addr):
         log.warning("Email enabled but credentials env vars not fully set.")
-        return
+        return False
     body = f"{entry.get('title', '')}\n\n{entry.get('link', '')}\n\nSource: {source}"
     msg = MIMEText(body)
     msg["Subject"] = f"[Deal Alert] {entry.get('title', '')}"
@@ -180,29 +186,40 @@ def notify_email(cfg: dict, source: str, entry) -> None:
             server.starttls()
             server.login(from_addr, password)
             server.sendmail(from_addr, [to_addr], msg.as_string())
+        return True
     except Exception as e:  # noqa: BLE001
         log.error("Email send error: %s", e)
+        return False
 
 
-def dispatch_notifications(cfg: dict, source: str, entry) -> None:
+def dispatch_notifications(cfg: dict, source: str, entry) -> bool:
+    """Fire all enabled notifiers for one matching entry.
+
+    Returns False if ANY enabled channel failed to deliver, so the caller
+    can surface that as a run failure rather than silently succeeding.
+    """
     notif_cfg = cfg.get("notifications", {})
+    all_ok = True
     if notif_cfg.get("console", True):
-        notify_console(source, entry)
+        notify_console(source, entry)  # console can't meaningfully "fail"
     if notif_cfg.get("telegram", {}).get("enabled"):
-        notify_telegram(notif_cfg["telegram"], source, entry)
+        all_ok = notify_telegram(notif_cfg["telegram"], source, entry) and all_ok
     if notif_cfg.get("discord", {}).get("enabled"):
-        notify_discord(notif_cfg["discord"], source, entry)
+        all_ok = notify_discord(notif_cfg["discord"], source, entry) and all_ok
     if notif_cfg.get("email", {}).get("enabled"):
-        notify_email(notif_cfg["email"], source, entry)
+        all_ok = notify_email(notif_cfg["email"], source, entry) and all_ok
+    return all_ok
 
 
 # ---------------------------------------------------------------------
 # Core run loop
 # ---------------------------------------------------------------------
 
-def run_once(cfg: dict, seen_path: Path, ignore_keywords: bool = False) -> int:
+def run_once(cfg: dict, seen_path: Path, ignore_keywords: bool = False) -> tuple[int, int]:
+    """Returns (new_matching_deals, notification_failures)."""
     seen = load_seen(seen_path)
     new_count = 0
+    failure_count = 0
 
     for feed in cfg.get("feeds", []):
         name, url = feed["name"], feed["url"]
@@ -216,11 +233,13 @@ def run_once(cfg: dict, seen_path: Path, ignore_keywords: bool = False) -> int:
             seen.add(eid)  # mark as seen regardless of match, so we don't re-check it forever
 
             if is_relevant(entry, cfg, ignore_keywords):
-                dispatch_notifications(cfg, name, entry)
                 new_count += 1
+                if not dispatch_notifications(cfg, name, entry):
+                    failure_count += 1
+                    log.error("Notification delivery FAILED for: %s", entry.get("title", ""))
 
     save_seen(seen_path, seen)
-    return new_count
+    return new_count, failure_count
 
 
 def main():
@@ -238,14 +257,20 @@ def main():
         log.info("Starting monitor loop — polling every %d minutes. Ctrl+C to stop.", interval // 60)
         while True:
             try:
-                found = run_once(cfg, seen_path, ignore_keywords=args.all)
-                log.info("Cycle complete — %d new matching deal(s).", found)
+                found, failures = run_once(cfg, seen_path, ignore_keywords=args.all)
+                log.info("Cycle complete — %d new matching deal(s), %d notification failure(s).", found, failures)
             except Exception as e:  # noqa: BLE001 — keep the loop alive on transient errors
                 log.error("Unexpected error in cycle: %s", e)
             time.sleep(interval)
     else:
-        found = run_once(cfg, seen_path, ignore_keywords=args.all)
-        log.info("Done — %d new matching deal(s).", found)
+        found, failures = run_once(cfg, seen_path, ignore_keywords=args.all)
+        log.info("Done — %d new matching deal(s), %d notification failure(s).", found, failures)
+        if failures:
+            log.error(
+                "%d deal(s) were found but NOT successfully delivered to a notification channel. "
+                "Exiting with an error so this run is visible as a failure.", failures
+            )
+            sys.exit(1)
         sys.exit(0)
 
 
