@@ -29,8 +29,7 @@ feeds:
   #   url: "https://www.theflightdeal.com/category/flight-deals/lon/feed/"
 
 # --- Keyword filters ------------------------------------------------
-# An item is flagged as a "hot deal" if its title/summary matches ANY
-# of these. Leave keywords empty [] to get every post from every feed.
+# "Error fare" language — used by the hot-deal rule below regardless of price.
 error_fare_keywords:
   - "error fare"
   - "mistake fare"
@@ -39,16 +38,50 @@ error_fare_keywords:
   - "pricing error"
   - "fare error"
 
-# Optional: only alert on deals mentioning these origins/destinations.
-# Leave empty [] to match any location. Matching is case-insensitive
-# substring matching against the post title.
+# --- Two-tier matching rule -----------------------------------------
+# A post is flagged if EITHER of these is true:
 #
-# Set to filter for flights departing FROM Europe. This is a
-# best-effort text match against post titles (deal blogs are not
-# perfectly consistent about naming), covering major European cities,
-# countries, and airport codes commonly used in these blogs' titles.
-# Add/remove entries to fit your home airport(s).
-origin_keywords:
+#   Tier 1 (priority routes): departs from one of your priority
+#     airports/cities AND the price is at or under price_max_normal_eur.
+#
+#   Tier 2 (hot deals, any European origin): departs from ANYWHERE in
+#     Europe AND (it's an error/mistake fare OR the price is at or
+#     under price_max_hot_eur) — regardless of departure city.
+#
+# Price is extracted from the post title/summary text (deal blogs
+# almost always state it there, e.g. "for only €300"). If no price can
+# be found, Tier 1 never matches (price is required); Tier 2 can still
+# match on error-fare language alone even with no price found.
+
+price_max_normal_eur: 550
+price_max_hot_eur: 350
+
+# Priority departure airports/cities — edit freely to match your
+# actual home airports. Matching is case-insensitive substring
+# matching against the post title + summary.
+origin_priority_keywords:
+  - "Vilnius"
+  - "VNO"
+  - "Riga"
+  - "RIX"
+  - "Warsaw"
+  - "WAW"
+  - "WMI"       # Warsaw Modlin (budget carrier alternate airport)
+  - "Copenhagen"
+  - "CPH"
+  - "Stockholm"
+  - "ARN"
+  - "Milan"
+  - "Milano"
+  - "MXP"       # Malpensa
+  - "LIN"       # Linate
+  - "BGY"       # Bergamo/Orio al Serio (budget carrier alternate airport)
+
+# Broader "anywhere in Europe" list, used only for Tier 2 (hot deals).
+# This intentionally covers a lot more cities than your priority list,
+# since Tier 2 exists specifically to catch great deals you'd still
+# want to know about even from an airport you don't usually fly from.
+origin_europe_keywords:
   - "Europe"
   - "European"
   - "London"
@@ -60,22 +93,16 @@ origin_keywords:
   - "Madrid"
   - "Barcelona"
   - "Rome"
-  - "Milan"
   - "Vienna"
   - "Zurich"
   - "Brussels"
-  - "Copenhagen"
-  - "Stockholm"
   - "Oslo"
   - "Helsinki"
-  - "Warsaw"
   - "Prague"
   - "Budapest"
   - "Lisbon"
   - "Dublin"
   - "Athens"
-  - "Vilnius"
-  - "Riga"
   - "Tallinn"
   - "from Germany"
   - "from France"
@@ -83,7 +110,6 @@ origin_keywords:
   - "from Italy"
   - "from Poland"
   - "from the UK"
-  # Airport codes commonly used in deal-blog titles:
   - "LHR"
   - "LGW"
   - "CDG"
@@ -95,12 +121,37 @@ origin_keywords:
   - "FCO"
   - "VIE"
   - "ZRH"
-  - "WAW"
+  # Also include the priority list, so Tier 2 matches from those
+  # cities too (e.g. a cheap error fare from Vilnius should still
+  # flag under Tier 2, not just Tier 1):
+  - "Vilnius"
   - "VNO"
+  - "Riga"
+  - "RIX"
+  - "Warsaw"
+  - "WAW"
+  - "Copenhagen"
+  - "CPH"
+  - "Stockholm"
+  - "ARN"
+  - "Milan"
+  - "Milano"
+  - "MXP"
 
 destination_keywords: []
   # - "Tokyo"
   # - "Bali"
+
+# Approximate conversion rates TO EUR, used when a post's price is
+# listed in a different currency (e.g. "£570", "$400"). These are
+# rough and will drift over time — update periodically, or treat
+# price filtering as approximate rather than exact.
+currency_to_eur_rates:
+  EUR: 1.0
+  GBP: 1.17
+  USD: 0.92
+  PLN: 0.23
+  SEK: 0.087   # also used as a rough stand-in for DKK/NOK ("kr")
 
 # --- Polling ----------------------------------------------------
 poll_interval_minutes: 15
