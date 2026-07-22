@@ -1,0 +1,26 @@
+# Optional: run the monitor continuously as a systemd service (Linux server / Raspberry Pi / VPS).
+# Install:
+#   sudo cp deal-monitor.service /etc/systemd/system/
+#   sudo systemctl daemon-reload
+#   sudo systemctl enable --now deal-monitor
+# Logs:
+#   journalctl -u deal-monitor -f
+#
+# Edit the paths, User, and EnvironmentFile below to match your setup first.
+
+[Unit]
+Description=Flight Deal / Error Fare Monitor
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=YOUR_LINUX_USERNAME
+WorkingDirectory=/path/to/deal_monitor
+EnvironmentFile=/path/to/deal_monitor/.env
+ExecStart=/usr/bin/python3 /path/to/deal_monitor/deal_monitor.py --loop
+Restart=on-failure
+RestartSec=30
+
+[Install]
+WantedBy=multi-user.target

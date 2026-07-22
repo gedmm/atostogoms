@@ -1,0 +1,135 @@
+# ============================================================
+# Flight Deal Monitor — Configuration
+# ============================================================
+
+# --- Feed sources -------------------------------------------------
+# Add/remove feeds freely. Most travel-deal blogs run WordPress,
+# so "siteurl.com/feed/" almost always works even if not listed here.
+feeds:
+  - name: "TravelFree"
+    url: "https://travelfree.info/feed/"
+  - name: "Secret Flying (Europe deals)"
+    url: "https://www.secretflying.com/euro-deals/feed/"
+  - name: "Secret Flying (Error Fares)"
+    url: "https://www.secretflying.com/error-fares/feed/"
+  - name: "Fly4Free"
+    url: "https://www.fly4free.com/feed/"
+  - name: "Fly4Free (Error Fares)"
+    url: "https://www.fly4free.com/flight-deals/error-fare/feed/"
+  - name: "Travel-Dealz"
+    url: "https://www.travel-dealz.com/feed/"
+  - name: "Thrifty Traveler"
+    url: "https://thriftytraveler.com/feed/"
+  - name: "Fare Deal Alert"
+    url: "https://www.faredealalert.com/feed/"
+  - name: "The Flight Deal (all)"
+    url: "https://www.theflightdeal.com/feed/"
+  # Add your specific home airport(s) here if you want, e.g.:
+  # - name: "The Flight Deal (LHR/LGW/STN)"
+  #   url: "https://www.theflightdeal.com/category/flight-deals/lon/feed/"
+
+# --- Keyword filters ------------------------------------------------
+# An item is flagged as a "hot deal" if its title/summary matches ANY
+# of these. Leave keywords empty [] to get every post from every feed.
+error_fare_keywords:
+  - "error fare"
+  - "mistake fare"
+  - "glitch"
+  - "fuel dump"
+  - "pricing error"
+  - "fare error"
+
+# Optional: only alert on deals mentioning these origins/destinations.
+# Leave empty [] to match any location. Matching is case-insensitive
+# substring matching against the post title.
+#
+# Set to filter for flights departing FROM Europe. This is a
+# best-effort text match against post titles (deal blogs are not
+# perfectly consistent about naming), covering major European cities,
+# countries, and airport codes commonly used in these blogs' titles.
+# Add/remove entries to fit your home airport(s).
+origin_keywords:
+  - "Europe"
+  - "European"
+  - "London"
+  - "Paris"
+  - "Berlin"
+  - "Frankfurt"
+  - "Munich"
+  - "Amsterdam"
+  - "Madrid"
+  - "Barcelona"
+  - "Rome"
+  - "Milan"
+  - "Vienna"
+  - "Zurich"
+  - "Brussels"
+  - "Copenhagen"
+  - "Stockholm"
+  - "Oslo"
+  - "Helsinki"
+  - "Warsaw"
+  - "Prague"
+  - "Budapest"
+  - "Lisbon"
+  - "Dublin"
+  - "Athens"
+  - "Vilnius"
+  - "Riga"
+  - "Tallinn"
+  - "from Germany"
+  - "from France"
+  - "from Spain"
+  - "from Italy"
+  - "from Poland"
+  - "from the UK"
+  # Airport codes commonly used in deal-blog titles:
+  - "LHR"
+  - "LGW"
+  - "CDG"
+  - "FRA"
+  - "MUC"
+  - "AMS"
+  - "MAD"
+  - "BCN"
+  - "FCO"
+  - "VIE"
+  - "ZRH"
+  - "WAW"
+  - "VNO"
+
+destination_keywords: []
+  # - "Tokyo"
+  # - "Bali"
+
+# --- Polling ----------------------------------------------------
+poll_interval_minutes: 15
+
+# --- Notifications ------------------------------------------------
+# Enable one or more channels. Fill in credentials via environment
+# variables (recommended) or directly here.
+notifications:
+  console: true          # always-on fallback, prints to stdout
+
+  telegram:
+    enabled: false
+    bot_token_env: "TELEGRAM_BOT_TOKEN"
+    chat_id_env: "TELEGRAM_CHAT_ID"
+
+  discord:
+    enabled: false
+    webhook_url_env: "DISCORD_WEBHOOK_URL"
+
+  email:
+    enabled: true
+    smtp_host: "smtp.gmail.com"   # change if using a different provider (see README)
+    smtp_port: 587
+    from_addr_env: "DEAL_MONITOR_EMAIL_FROM"
+    password_env: "DEAL_MONITOR_EMAIL_PASSWORD"
+    to_addr_env: "DEAL_MONITOR_EMAIL_TO"
+
+# --- Storage --------------------------------------------------------
+# When running locally this file lands next to the script. When running
+# via Docker, docker-compose.yml mounts ./data as /app/data so this
+# persists across container restarts/rebuilds.
+seen_items_file: "data/seen_items.json"

@@ -1,0 +1,15 @@
+services:
+  deal-monitor:
+    build: .
+    container_name: deal-monitor
+    restart: unless-stopped
+    env_file:
+      - .env
+    volumes:
+      # Persist dedup state across restarts/rebuilds
+      - ./data:/app/data
+      # Mount config so you can edit it without rebuilding the image
+      - ./config.yaml:/app/config.yaml:ro
+    # Uncomment to run a single check-and-exit instead of the continuous loop
+    # (e.g. if you'd rather schedule it with an external cron):
+    # command: ["--all"]
