@@ -1,0 +1,54 @@
+name: Flight Deal Monitor
+
+on:
+  schedule:
+    # Every 15 minutes. GitHub's scheduler is best-effort and can drift
+    # a few minutes under load — fine for this use case, but if you need
+    # tighter timing, self-hosting (see README) is the alternative.
+    - cron: "*/15 * * * *"
+  workflow_dispatch: {}   # lets you trigger a run manually from the Actions tab
+
+permissions:
+  contents: write   # needed so the workflow can commit updated seen_items.json back
+
+concurrency:
+  group: deal-monitor
+  cancel-in-progress: false   # never cancel a run mid-check; let it finish and commit
+
+jobs:
+  check-deals:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Check out repo
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run deal check
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
+          DEAL_MONITOR_EMAIL_FROM: ${{ secrets.DEAL_MONITOR_EMAIL_FROM }}
+          DEAL_MONITOR_EMAIL_PASSWORD: ${{ secrets.DEAL_MONITOR_EMAIL_PASSWORD }}
+          DEAL_MONITOR_EMAIL_TO: ${{ secrets.DEAL_MONITOR_EMAIL_TO }}
+        run: python deal_monitor.py   # single check-and-exit; --loop is not used here since cron IS the loop
+
+      - name: Persist dedup state (data/seen_items.json)
+        run: |
+          if [ -n "$(git status --porcelain data/seen_items.json 2>/dev/null)" ]; then
+            git config user.name "deal-monitor-bot"
+            git config user.email "actions@users.noreply.github.com"
+            git add data/seen_items.json
+            git commit -m "chore: update seen items [skip ci]"
+            git push
+          else
+            echo "No new deals — nothing to persist."
+          fi
