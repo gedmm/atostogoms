@@ -31,6 +31,7 @@ import hashlib
 import json
 import logging
 import os
+import re
 import smtplib
 import sys
 import time
@@ -104,39 +105,142 @@ def matches_keywords(text: str, keywords: list) -> bool:
     return any(kw.lower() in text_lower for kw in keywords)
 
 
-def is_relevant(entry, cfg: dict, ignore_keywords: bool) -> bool:
+# Price patterns, checked in this order, first match in the text wins
+# (deal-blog titles almost always lead with the headline price, so the
+# earliest match in the string is the one we want, not the cheapest).
+# Each tuple is (compiled regex with one capture group for the number, currency code).
+_PRICE_PATTERNS = [
+    (re.compile(r'(?:€|EUR)\s?(\d[\d.,]*)', re.I), "EUR"),
+    (re.compile(r'(\d[\d.,]*)\s?(?:€|EUR)\b', re.I), "EUR"),
+    (re.compile(r'(?:£|GBP)\s?(\d[\d.,]*)', re.I), "GBP"),
+    (re.compile(r'(\d[\d.,]*)\s?(?:£|GBP)\b', re.I), "GBP"),
+    (re.compile(r'(?:\$|USD)\s?(\d[\d.,]*)', re.I), "USD"),
+    (re.compile(r'(\d[\d.,]*)\s?(?:\$|USD)\b', re.I), "USD"),
+    (re.compile(r'(\d[\d.,]*)\s?(?:zł|PLN)\b', re.I), "PLN"),
+    (re.compile(r'(\d[\d.,]*)\s?(?:kr|SEK|DKK|NOK)\b', re.I), "SEK"),
+]
+
+
+def extract_price_eur(text: str, rates: dict):
+    """Find the first price mentioned in text and convert it to EUR.
+
+    Returns (eur_amount, original_amount, currency_code) or None if no
+    price pattern is found at all.
+    """
+    best = None  # (position, eur_amount, original_amount, currency)
+    for pattern, currency in _PRICE_PATTERNS:
+        m = pattern.search(text)
+        if not m:
+            continue
+        if best is not None and m.start() >= best[0]:
+            continue  # a match earlier in the string already wins
+        raw = m.group(1).replace(",", "")
+        try:
+            amount = float(raw)
+        except ValueError:
+            continue
+        rate = rates.get(currency, 1.0)
+        best = (m.start(), amount * rate, amount, currency)
+
+    if best is None:
+        return None
+    _, eur_amount, original_amount, currency = best
+    return eur_amount, original_amount, currency
+
+
+def evaluate_deal(entry, cfg: dict, ignore_keywords: bool = False):
+    """Decide whether a post matches, and why.
+
+    Two-tier rule:
+      Tier 1 ("priority"): departs a priority airport/city AND price <= price_max_normal_eur.
+      Tier 2 ("hot"): departs ANYWHERE in Europe AND (error-fare language OR price <= price_max_hot_eur).
+
+    Returns a dict with keys: matched (bool), tier (str|None), price_eur,
+    price_original, currency, is_error_fare (bool). Always returns a dict
+    (never None) so callers can inspect price info even on a non-match.
+    """
     title = entry.get("title", "")
     summary = entry.get("summary", "")
     haystack = f"{title} {summary}"
 
-    if not ignore_keywords and not matches_keywords(haystack, cfg.get("error_fare_keywords", [])):
-        return False
-    if not matches_keywords(haystack, cfg.get("origin_keywords", [])):
-        return False
-    if not matches_keywords(haystack, cfg.get("destination_keywords", [])):
-        return False
-    return True
+    price_info = extract_price_eur(haystack, cfg.get("currency_to_eur_rates", {}))
+    price_eur, price_original, currency = price_info if price_info else (None, None, None)
+
+    is_error_fare = matches_keywords(haystack, cfg.get("error_fare_keywords", []))
+    in_priority_cities = matches_keywords(haystack, cfg.get("origin_priority_keywords", []))
+    in_europe = matches_keywords(haystack, cfg.get("origin_europe_keywords", []))
+    dest_ok = matches_keywords(haystack, cfg.get("destination_keywords", []))
+
+    result = {
+        "matched": False,
+        "tier": None,
+        "price_eur": price_eur,
+        "price_original": price_original,
+        "currency": currency,
+        "is_error_fare": is_error_fare,
+    }
+
+    if not dest_ok:
+        return result
+
+    if ignore_keywords:
+        result["matched"] = True
+        result["tier"] = "test"
+        return result
+
+    price_max_hot = cfg.get("price_max_hot_eur", 350)
+    price_max_normal = cfg.get("price_max_normal_eur", 550)
+
+    # Tier 2 first: any European origin, error fare OR very cheap.
+    if in_europe and (is_error_fare or (price_eur is not None and price_eur <= price_max_hot)):
+        result["matched"] = True
+        result["tier"] = "hot"
+        return result
+
+    # Tier 1: priority route, under the normal price cap. Price must be known.
+    if in_priority_cities and price_eur is not None and price_eur <= price_max_normal:
+        result["matched"] = True
+        result["tier"] = "priority"
+        return result
+
+    return result
 
 
 # ---------------------------------------------------------------------
 # Notifiers
 # ---------------------------------------------------------------------
 
-def notify_console(source: str, entry) -> None:
+def build_label(match: dict) -> str:
+    """Human-readable tag describing why a deal matched, for use in alerts."""
+    tier = match.get("tier")
+    price_eur = match.get("price_eur")
+    price_bit = f"~€{price_eur:.0f}" if price_eur is not None else "price unknown"
+
+    if tier == "hot":
+        reason = "error fare" if match.get("is_error_fare") else f"under hot-deal threshold, {price_bit}"
+        return f"🔥 HOT DEAL ({reason})"
+    if tier == "priority":
+        return f"⭐ PRIORITY ROUTE ({price_bit})"
+    if tier == "test":
+        return "🧪 TEST MODE"
+    return "✈️ DEAL"
+
+
+def notify_console(source: str, entry, match: dict) -> None:
     print("\n" + "=" * 60)
-    print(f"✈️  NEW DEAL — {source}")
+    print(f"{build_label(match)} — {source}")
     print(entry.get("title", "(no title)"))
     print(entry.get("link", ""))
     print("=" * 60)
 
 
-def notify_telegram(cfg: dict, source: str, entry) -> bool:
+def notify_telegram(cfg: dict, source: str, entry, match: dict) -> bool:
     token = os.environ.get(cfg["bot_token_env"], "")
     chat_id = os.environ.get(cfg["chat_id_env"], "")
     if not token or not chat_id:
         log.warning("Telegram enabled but %s/%s env vars not set.", cfg["bot_token_env"], cfg["chat_id_env"])
         return False
-    text = f"✈️ *{source}*\n{entry.get('title', '')}\n{entry.get('link', '')}"
+    text = f"{build_label(match)}\n*{source}*\n{entry.get('title', '')}\n{entry.get('link', '')}"
     try:
         resp = requests.post(
             f"https://api.telegram.org/bot{token}/sendMessage",
@@ -152,12 +256,12 @@ def notify_telegram(cfg: dict, source: str, entry) -> bool:
         return False
 
 
-def notify_discord(cfg: dict, source: str, entry) -> bool:
+def notify_discord(cfg: dict, source: str, entry, match: dict) -> bool:
     webhook = os.environ.get(cfg["webhook_url_env"], "")
     if not webhook:
         log.warning("Discord enabled but %s env var not set.", cfg["webhook_url_env"])
         return False
-    content = f"✈️ **{source}**\n{entry.get('title', '')}\n{entry.get('link', '')}"
+    content = f"{build_label(match)}\n**{source}**\n{entry.get('title', '')}\n{entry.get('link', '')}"
     try:
         resp = requests.post(webhook, json={"content": content}, timeout=15)
         if resp.status_code >= 300:
@@ -169,16 +273,17 @@ def notify_discord(cfg: dict, source: str, entry) -> bool:
         return False
 
 
-def notify_email(cfg: dict, source: str, entry) -> bool:
+def notify_email(cfg: dict, source: str, entry, match: dict) -> bool:
     from_addr = os.environ.get(cfg["from_addr_env"], "")
     password = os.environ.get(cfg["password_env"], "")
     to_addr = os.environ.get(cfg["to_addr_env"], "")
     if not (from_addr and password and to_addr):
         log.warning("Email enabled but credentials env vars not fully set.")
         return False
-    body = f"{entry.get('title', '')}\n\n{entry.get('link', '')}\n\nSource: {source}"
+    label = build_label(match)
+    body = f"{label}\n\n{entry.get('title', '')}\n\n{entry.get('link', '')}\n\nSource: {source}"
     msg = MIMEText(body)
-    msg["Subject"] = f"[Deal Alert] {entry.get('title', '')}"
+    msg["Subject"] = f"[Deal Alert] {label} — {entry.get('title', '')}"
     msg["From"] = from_addr
     msg["To"] = to_addr
     try:
@@ -192,7 +297,7 @@ def notify_email(cfg: dict, source: str, entry) -> bool:
         return False
 
 
-def dispatch_notifications(cfg: dict, source: str, entry) -> bool:
+def dispatch_notifications(cfg: dict, source: str, entry, match: dict) -> bool:
     """Fire all enabled notifiers for one matching entry.
 
     Returns False if ANY enabled channel failed to deliver, so the caller
@@ -201,13 +306,13 @@ def dispatch_notifications(cfg: dict, source: str, entry) -> bool:
     notif_cfg = cfg.get("notifications", {})
     all_ok = True
     if notif_cfg.get("console", True):
-        notify_console(source, entry)  # console can't meaningfully "fail"
+        notify_console(source, entry, match)  # console can't meaningfully "fail"
     if notif_cfg.get("telegram", {}).get("enabled"):
-        all_ok = notify_telegram(notif_cfg["telegram"], source, entry) and all_ok
+        all_ok = notify_telegram(notif_cfg["telegram"], source, entry, match) and all_ok
     if notif_cfg.get("discord", {}).get("enabled"):
-        all_ok = notify_discord(notif_cfg["discord"], source, entry) and all_ok
+        all_ok = notify_discord(notif_cfg["discord"], source, entry, match) and all_ok
     if notif_cfg.get("email", {}).get("enabled"):
-        all_ok = notify_email(notif_cfg["email"], source, entry) and all_ok
+        all_ok = notify_email(notif_cfg["email"], source, entry, match) and all_ok
     return all_ok
 
 
@@ -232,9 +337,10 @@ def run_once(cfg: dict, seen_path: Path, ignore_keywords: bool = False) -> tuple
                 continue
             seen.add(eid)  # mark as seen regardless of match, so we don't re-check it forever
 
-            if is_relevant(entry, cfg, ignore_keywords):
+            match = evaluate_deal(entry, cfg, ignore_keywords)
+            if match["matched"]:
                 new_count += 1
-                if not dispatch_notifications(cfg, name, entry):
+                if not dispatch_notifications(cfg, name, entry, match):
                     failure_count += 1
                     log.error("Notification delivery FAILED for: %s", entry.get("title", ""))
 
