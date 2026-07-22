@@ -6,7 +6,12 @@ on:
     # a few minutes under load — fine for this use case, but if you need
     # tighter timing, self-hosting (see README) is the alternative.
     - cron: "*/15 * * * *"
-  workflow_dispatch: {}   # lets you trigger a run manually from the Actions tab
+  workflow_dispatch:
+    inputs:
+      test_mode:
+        description: "Ignore keyword filters and alert on newest post from each feed (use to test notifications)"
+        type: boolean
+        default: false
 
 permissions:
   contents: write   # needed so the workflow can commit updated seen_items.json back
@@ -39,7 +44,13 @@ jobs:
           DEAL_MONITOR_EMAIL_FROM: ${{ secrets.DEAL_MONITOR_EMAIL_FROM }}
           DEAL_MONITOR_EMAIL_PASSWORD: ${{ secrets.DEAL_MONITOR_EMAIL_PASSWORD }}
           DEAL_MONITOR_EMAIL_TO: ${{ secrets.DEAL_MONITOR_EMAIL_TO }}
-        run: python deal_monitor.py   # single check-and-exit; --loop is not used here since cron IS the loop
+        run: |
+          if [ "${{ inputs.test_mode }}" = "true" ]; then
+            echo "Running in TEST MODE — keyword filters bypassed, will alert on newest post per feed."
+            python deal_monitor.py --all
+          else
+            python deal_monitor.py
+          fi
 
       - name: Persist dedup state (data/seen_items.json)
         run: |
