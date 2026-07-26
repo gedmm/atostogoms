@@ -170,12 +170,52 @@ def extract_price_eur(text: str, rates: dict):
     return eur_amount, original_amount, currency
 
 
+def extract_origin_destination(title: str, summary: str):
+    """Best-effort split of 'from X to Y' style text into (origin_text,
+    destination_text). Deal-blog titles are very consistently phrased this
+    way, e.g. "Error Fare flights from Vilnius to Bangkok for only €180".
+
+    Returns (origin_text, destination_text, parsed_ok). When parsing fails
+    (title doesn't follow this pattern), returns the full text for both
+    fields with parsed_ok=False, so callers can fall back to matching
+    against the whole string rather than silently matching nothing.
+    """
+    text = f"{title} {summary}"
+    # Primary pattern: "from X to Y" (optionally cut off at "for €..." or punctuation)
+    m = re.search(r'\bfrom\s+(.+?)\s+\bto\b\s+(.+?)(?=\s+\bfor\b|[.,!?;]|$)', text, re.I)
+    if m:
+        return m.group(1).strip(), m.group(2).strip(), True
+
+    # Fallback pattern: "X to Y" without a leading "from" (e.g. "Warsaw to Bali for €480")
+    m = re.search(r'^(.+?)\s+\bto\b\s+(.+?)(?=\s+\bfor\b|[.,!?;]|$)', title, re.I)
+    if m:
+        return m.group(1).strip(), m.group(2).strip(), True
+
+    # Couldn't parse a route — fall back to matching the whole text for both,
+    # which is less precise (may match a city mentioned anywhere) but at
+    # least doesn't silently drop the post entirely.
+    return text, text, False
+
+
 def evaluate_deal(entry, cfg: dict, ignore_keywords: bool = False):
     """Decide whether a post matches, and why.
 
-    Two-tier rule:
-      Tier 1 ("priority"): departs a priority airport/city AND price <= price_max_normal_eur.
-      Tier 2 ("hot"): departs ANYWHERE in Europe AND (error-fare language OR price <= price_max_hot_eur).
+    Origin/destination matching is done against the parsed "from X to Y"
+    departure/arrival text specifically — NOT the whole title — so a post
+    like "flights from Bangkok to London" is correctly treated as
+    departing Bangkok, not as a European departure just because London
+    is mentioned as the destination.
+
+    Rule:
+      - Error fares: origin ANYWHERE in Europe (origin_europe_keywords)
+        AND error-fare language. Price is irrelevant here — unchanged
+        from before.
+      - Hot (cheap, non-error-fare): origin must be one of your priority
+        cities (origin_priority_keywords) AND price <= price_max_hot_eur.
+        No longer matches from elsewhere in Europe — only your specific
+        departure cities.
+      - Priority (moderate price, non-error-fare): origin is a priority
+        city AND price_max_hot_eur < price <= price_max_normal_eur.
 
     Returns a dict with keys: matched (bool), tier (str|None), price_eur,
     price_original, currency, is_error_fare (bool). Always returns a dict
@@ -185,13 +225,20 @@ def evaluate_deal(entry, cfg: dict, ignore_keywords: bool = False):
     summary = entry.get("summary", "")
     haystack = f"{title} {summary}"
 
+    origin_text, destination_text, parsed_ok = extract_origin_destination(title, summary)
+    if not parsed_ok:
+        log.debug("Could not parse 'from X to Y' route for: %s — falling back to whole-text matching.", title)
+
     price_info = extract_price_eur(haystack, cfg.get("currency_to_eur_rates", {}))
     price_eur, price_original, currency = price_info if price_info else (None, None, None)
 
+    # Error-fare language is checked across the whole text (title/summary),
+    # since it's not location-specific — unchanged from before.
     is_error_fare = matches_keywords(haystack, cfg.get("error_fare_keywords", []))
-    in_priority_cities = matches_keywords(haystack, cfg.get("origin_priority_keywords", []))
-    in_europe = matches_keywords(haystack, cfg.get("origin_europe_keywords", []))
-    dest_ok = matches_keywords(haystack, cfg.get("destination_keywords", []))
+
+    in_priority_cities = matches_keywords(origin_text, cfg.get("origin_priority_keywords", []))
+    in_europe = matches_keywords(origin_text, cfg.get("origin_europe_keywords", []))
+    dest_ok = matches_keywords(destination_text, cfg.get("destination_keywords", []))
 
     result = {
         "matched": False,
@@ -213,16 +260,20 @@ def evaluate_deal(entry, cfg: dict, ignore_keywords: bool = False):
     price_max_hot = cfg.get("price_max_hot_eur", 350)
     price_max_normal = cfg.get("price_max_normal_eur", 550)
 
-    # Tier 2 first: any European origin, error fare OR very cheap.
-    if in_europe and (is_error_fare or (price_eur is not None and price_eur <= price_max_hot)):
+    # Error fares: unchanged — any European origin, regardless of price.
+    if in_europe and is_error_fare:
         result["matched"] = True
         result["tier"] = "hot"
         return result
 
-    # Tier 1: priority route, under the normal price cap. Price must be known.
-    if in_priority_cities and price_eur is not None and price_eur <= price_max_normal:
-        result["matched"] = True
-        result["tier"] = "priority"
+    # Everything else requires a priority-city origin AND a known price.
+    if in_priority_cities and price_eur is not None:
+        if price_eur <= price_max_hot:
+            result["matched"] = True
+            result["tier"] = "hot"
+        elif price_eur <= price_max_normal:
+            result["matched"] = True
+            result["tier"] = "priority"
         return result
 
     return result
