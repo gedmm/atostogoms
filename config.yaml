@@ -39,22 +39,33 @@ error_fare_keywords:
   - "fare error"
 
 # --- Two-tier matching rule -----------------------------------------
+# Origin matching only looks at the departure part of "from X to Y" in
+# the post title/summary — a flight TO a European city (not FROM one)
+# will correctly NOT count as a European departure.
+#
 # A post is flagged if EITHER of these is true:
 #
-#   Tier 1 (priority routes): departs from one of your priority
-#     airports/cities AND the price is at or under price_max_normal_eur.
+#   Error fares (unchanged): departs ANYWHERE in Europe
+#     (origin_europe_keywords) AND matches error_fare_keywords.
+#     Price is irrelevant here — an error fare is worth knowing about
+#     regardless of price.
 #
-#   Tier 2 (hot deals, any European origin): departs from ANYWHERE in
-#     Europe AND (it's an error/mistake fare OR the price is at or
-#     under price_max_hot_eur) — regardless of departure city.
+#   Priority-city deals: departs one of YOUR priority
+#     airports/cities (origin_priority_keywords) AND the price is at or
+#     under price_max_normal_eur. Within that, deals at or under
+#     price_max_hot_eur are tagged "hot" instead of "priority" — same
+#     origin requirement either way, just a price-based label split.
+#     This tier no longer matches from anywhere else in Europe — only
+#     your specific departure cities.
 #
 # Price is extracted from the post title/summary text (deal blogs
 # almost always state it there, e.g. "for only €300"). If no price can
-# be found, Tier 1 never matches (price is required); Tier 2 can still
-# match on error-fare language alone even with no price found.
+# be found, the priority-city tier never matches (price is required);
+# error fares can still match on error-fare language alone with no
+# price found.
 
-price_max_normal_eur: 450
-price_max_hot_eur: 300
+price_max_normal_eur: 550   # priority-city cap
+price_max_hot_eur: 350      # priority-city deals at/under this are tagged "hot" instead of "priority"
 
 # Priority departure airports/cities — edit freely to match your
 # actual home airports. Matching is case-insensitive substring
