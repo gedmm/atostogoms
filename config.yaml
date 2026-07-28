@@ -64,8 +64,8 @@ error_fare_keywords:
 # error fares can still match on error-fare language alone with no
 # price found.
 
-price_max_normal_eur: 550   # priority-city cap
-price_max_hot_eur: 350      # priority-city deals at/under this are tagged "hot" instead of "priority"
+price_max_normal_eur: 500   # priority-city cap
+price_max_hot_eur: 300      # priority-city deals at/under this are tagged "hot" instead of "priority"
 
 # Priority departure airports/cities — edit freely to match your
 # actual home airports. Matching is case-insensitive substring
