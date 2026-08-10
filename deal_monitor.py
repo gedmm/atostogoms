@@ -121,10 +121,19 @@ def fetch_feed(name: str, url: str):
 
 
 def matches_keywords(text: str, keywords: list) -> bool:
+    """Whole-word/phrase matching, case-insensitive. Deliberately NOT a
+    naive substring check — short airport codes like ARN, AMS, FRA, MAD
+    would otherwise false-match inside unrelated words ("earning" contains
+    "arn", "programs" contains "ams", "infrastructure" contains "fra",
+    "made"/"glad" contain "mad").
+    """
     if not keywords:
         return True
-    text_lower = text.lower()
-    return any(kw.lower() in text_lower for kw in keywords)
+    for kw in keywords:
+        pattern = r'(?<![A-Za-z])' + re.escape(kw) + r'(?![A-Za-z])'
+        if re.search(pattern, text, re.IGNORECASE):
+            return True
+    return False
 
 
 # Price patterns, checked in this order, first match in the text wins
@@ -226,8 +235,6 @@ def evaluate_deal(entry, cfg: dict, ignore_keywords: bool = False):
     haystack = f"{title} {summary}"
 
     origin_text, destination_text, parsed_ok = extract_origin_destination(title, summary)
-    if not parsed_ok:
-        log.debug("Could not parse 'from X to Y' route for: %s — falling back to whole-text matching.", title)
 
     price_info = extract_price_eur(haystack, cfg.get("currency_to_eur_rates", {}))
     price_eur, price_original, currency = price_info if price_info else (None, None, None)
@@ -236,9 +243,22 @@ def evaluate_deal(entry, cfg: dict, ignore_keywords: bool = False):
     # since it's not location-specific — unchanged from before.
     is_error_fare = matches_keywords(haystack, cfg.get("error_fare_keywords", []))
 
-    in_priority_cities = matches_keywords(origin_text, cfg.get("origin_priority_keywords", []))
-    in_europe = matches_keywords(origin_text, cfg.get("origin_europe_keywords", []))
-    dest_ok = matches_keywords(destination_text, cfg.get("destination_keywords", []))
+    if parsed_ok:
+        in_priority_cities = matches_keywords(origin_text, cfg.get("origin_priority_keywords", []))
+        in_europe = matches_keywords(origin_text, cfg.get("origin_europe_keywords", []))
+        dest_ok = matches_keywords(destination_text, cfg.get("destination_keywords", []))
+    else:
+        # Couldn't confidently identify the departure city from this title.
+        # Since departing Europe is a hard requirement, treat an unparseable
+        # route as "not confirmed Europe" rather than guessing from whatever
+        # words happen to appear in the full text — that guessing is exactly
+        # what let non-European posts slip through before (a summary
+        # mentioning "European residents" or "earn miles" could wrongly
+        # match on a whole-text scan even with word-boundary matching).
+        log.debug("Could not parse 'from X to Y' route for: %s — skipping (can't confirm origin).", title)
+        in_priority_cities = False
+        in_europe = False
+        dest_ok = matches_keywords(destination_text, cfg.get("destination_keywords", []))
 
     result = {
         "matched": False,
@@ -346,17 +366,44 @@ def notify_discord(cfg: dict, source: str, entry, match: dict) -> bool:
         return False
 
 
-def notify_email(cfg: dict, source: str, entry, match: dict) -> bool:
+def notify_email_digest(cfg: dict, deals: list) -> bool:
+    """Send ONE email bundling all deals found this run.
+
+    `deals` is a list of (source, entry, match) tuples. Called once at
+    the end of a run rather than once per deal, so a run that finds 5
+    matches produces 1 email, not 5.
+    """
     from_addr = os.environ.get(cfg["from_addr_env"], "")
     password = os.environ.get(cfg["password_env"], "")
     to_addr = os.environ.get(cfg["to_addr_env"], "")
     if not (from_addr and password and to_addr):
         log.warning("Email enabled but credentials env vars not fully set.")
         return False
-    label = build_label(match)
-    body = f"{label}\n\n{entry.get('title', '')}\n\n{entry.get('link', '')}\n\nSource: {source}"
+    if not deals:
+        return True  # nothing to send is not a failure
+
+    blocks = []
+    for source, entry, match in deals:
+        label = build_label(match)
+        blocks.append(f"{label} — {source}\n{entry.get('title', '')}\n{entry.get('link', '')}")
+    body = "\n\n----------------------------------------\n\n".join(blocks)
+
+    if len(deals) == 1:
+        _, entry, match = deals[0]
+        subject = f"[Deal Alert] {build_label(match)} — {entry.get('title', '')}"
+    else:
+        tiers = [m.get("tier") for _, _, m in deals]
+        hot_n = tiers.count("hot")
+        priority_n = tiers.count("priority")
+        parts = []
+        if hot_n:
+            parts.append(f"{hot_n} hot")
+        if priority_n:
+            parts.append(f"{priority_n} priority")
+        subject = f"[Deal Alert] {len(deals)} new deals found ({', '.join(parts)})"
+
     msg = MIMEText(body)
-    msg["Subject"] = f"[Deal Alert] {label} — {entry.get('title', '')}"
+    msg["Subject"] = subject
     msg["From"] = from_addr
     msg["To"] = to_addr
     try:
@@ -366,15 +413,17 @@ def notify_email(cfg: dict, source: str, entry, match: dict) -> bool:
             server.sendmail(from_addr, [to_addr], msg.as_string())
         return True
     except Exception as e:  # noqa: BLE001
-        log.error("Email send error: %s", e)
+        log.error("Email digest send error: %s", e)
         return False
 
 
 def dispatch_notifications(cfg: dict, source: str, entry, match: dict) -> bool:
-    """Fire all enabled notifiers for one matching entry.
+    """Fire the INSTANT notifiers (console, Telegram, Discord) for one
+    matching entry. Email is deliberately NOT sent here — it's batched
+    into a single end-of-run digest via notify_email_digest instead, so
+    a run with several matches produces one email rather than several.
 
-    Returns False if ANY enabled channel failed to deliver, so the caller
-    can surface that as a run failure rather than silently succeeding.
+    Returns False if any instant channel failed to deliver.
     """
     notif_cfg = cfg.get("notifications", {})
     all_ok = True
@@ -384,8 +433,6 @@ def dispatch_notifications(cfg: dict, source: str, entry, match: dict) -> bool:
         all_ok = notify_telegram(notif_cfg["telegram"], source, entry, match) and all_ok
     if notif_cfg.get("discord", {}).get("enabled"):
         all_ok = notify_discord(notif_cfg["discord"], source, entry, match) and all_ok
-    if notif_cfg.get("email", {}).get("enabled"):
-        all_ok = notify_email(notif_cfg["email"], source, entry, match) and all_ok
     return all_ok
 
 
@@ -504,6 +551,8 @@ def run_once(cfg: dict, seen_path: Path, health_path: Path, ignore_keywords: boo
         "dismissed": 0,         # new entries that did NOT match any tier
     }
     failure_count = 0
+    email_enabled = cfg.get("notifications", {}).get("email", {}).get("enabled", False)
+    email_digest_deals = []  # collected here, sent as ONE email at the end of the run
 
     for feed in cfg.get("feeds", []):
         name, url = feed["name"], feed["url"]
@@ -530,9 +579,19 @@ def run_once(cfg: dict, seen_path: Path, health_path: Path, ignore_keywords: boo
                 stats[f"matched_{match['tier']}"] = stats.get(f"matched_{match['tier']}", 0) + 1
                 if not dispatch_notifications(cfg, name, entry, match):
                     failure_count += 1
-                    log.error("Notification delivery FAILED for: %s", entry.get("title", ""))
+                    log.error("Instant notification delivery FAILED for: %s", entry.get("title", ""))
+                if email_enabled:
+                    email_digest_deals.append((name, entry, match))
             else:
                 stats["dismissed"] += 1
+
+    if email_enabled and email_digest_deals:
+        email_cfg = cfg["notifications"]["email"]
+        if not notify_email_digest(email_cfg, email_digest_deals):
+            failure_count += 1
+            log.error("Email digest delivery FAILED (%d deal(s) were not emailed).", len(email_digest_deals))
+        else:
+            log.info("Sent 1 digest email covering %d deal(s).", len(email_digest_deals))
 
     save_seen(seen_path, seen)
     save_feed_health(health_path, health)
